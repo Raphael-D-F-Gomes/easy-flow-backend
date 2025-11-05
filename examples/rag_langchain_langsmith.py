@@ -1,0 +1,169 @@
+"""Example RAG pipeline using LangChain and LangSmith.
+
+This standalone script shows how to:
+
+1. Create a small in-memory knowledge base and embed it with OpenAI embeddings.
+2. Store the embeddings in a FAISS vector store and expose a retriever.
+3. Build a retrieval-augmented generation (RAG) chain with LangChain Runnable
+   components.
+4. Instrument the pipeline with LangSmith so every step is traced and visible in
+   the LangSmith UI.
+
+Prerequisites
+-------------
+- Install dependencies: ``pip install langchain langchain-core langchain-openai
+  langchain-community langsmith faiss-cpu``
+- Export your OpenAI API key: ``export OPENAI_API_KEY=...``
+- (Optional but recommended) Enable LangSmith tracing in the same shell:
+  ``export LANGCHAIN_TRACING_V2=true`` and ``export LANGCHAIN_PROJECT=rag-demo``
+
+Running the script will print the retrieved context and the final answer while
+also sending detailed traces to LangSmith.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Iterable, List
+
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langsmith import Client
+from langsmith.run_helpers import traceable
+
+
+@traceable(name="load_corpus")
+def load_corpus() -> List[Document]:
+    """Return a toy set of documents that play the role of a knowledge base."""
+
+    return [
+        Document(
+            page_content=(
+                "LangChain is a framework for developing applications powered "
+                "by large language models. It offers integrations, chains, "
+                "agents, and common utilities for production-ready LLM apps."
+            ),
+            metadata={"source": "langchain_overview"},
+        ),
+        Document(
+            page_content=(
+                "LangSmith is an observability platform for LLM workflows. It "
+                "captures traces, helps debug prompts, and monitors quality "
+                "through evaluations and analytics."
+            ),
+            metadata={"source": "langsmith_overview"},
+        ),
+        Document(
+            page_content=(
+                "Retrieval-Augmented Generation (RAG) combines a retriever that "
+                "fetches relevant context with an LLM that grounds its answers "
+                "on this external knowledge."
+            ),
+            metadata={"source": "rag_definition"},
+        ),
+    ]
+
+
+@traceable(name="build_vector_store")
+def build_vector_store(documents: Iterable[Document]) -> FAISS:
+    """Embed the documents and index them inside a FAISS vector store."""
+
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+    return FAISS.from_documents(list(documents), embedding=embeddings)
+
+
+def _format_documents(documents: List[Document]) -> str:
+    """Concatenate retrieved documents into a single context string."""
+
+    formatted_blocks = []
+    for i, doc in enumerate(documents, start=1):
+        block = f"[Document {i} | source={doc.metadata.get('source', 'N/A')}]\n{doc.page_content}"
+        formatted_blocks.append(block)
+    return "\n\n".join(formatted_blocks)
+
+
+@traceable(name="build_rag_chain")
+def build_rag_chain(vector_store: FAISS) -> Runnable:
+    """Create the retrieval-augmented generation chain."""
+
+    retriever = vector_store.as_retriever(search_kwargs={"k": 2})
+
+    qa_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a concise technical assistant. Use the provided context "
+                "to answer the user's question. If the context lacks information, "
+                "say so explicitly.",
+            ),
+            (
+                "human",
+                "Context:\n{context}\n\nQuestion: {question}",
+            ),
+        ]
+    )
+
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+    rag_chain: Runnable = (
+        {"context": retriever | _format_documents, "question": RunnablePassthrough()}
+        | qa_prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    return rag_chain
+
+
+@traceable(name="run_pipeline")
+def run_pipeline(question: str) -> str:
+    """Execute the full RAG pipeline for the given user question."""
+
+    documents = load_corpus()
+    vector_store = build_vector_store(documents)
+    chain = build_rag_chain(vector_store)
+
+    answer = chain.invoke(question)
+    return answer
+
+
+def _ensure_langsmith_project(client: Client) -> None:
+    """Make sure a LangSmith project exists so traces are grouped coherently."""
+
+    project_name = os.getenv("LANGCHAIN_PROJECT", "rag-langsmith-demo")
+    client.create_project(
+        project_name=project_name,
+        description=(
+            "Example project generated by rag_langchain_langsmith.py. "
+            "Feel free to delete it once you are done exploring the traces."
+        ),
+    )
+
+
+def main() -> None:
+    """Orchestrate the demo run and print results to the console."""
+
+    client = Client()
+    _ensure_langsmith_project(client)
+
+    question = (
+        "How do LangChain and LangSmith work together to support RAG applications?"
+    )
+
+    print("Question:\n" + question + "\n")
+    answer = run_pipeline(question)
+    print("Answer:\n" + answer + "\n")
+
+    print(
+        "Inspect this run in LangSmith (if tracing is enabled) to see each step "
+        "-- document loading, embedding, retrieval, prompt formatting, and LLM "
+        "generation -- with their inputs and outputs."
+    )
+
+
+if __name__ == "__main__":
+    main()
